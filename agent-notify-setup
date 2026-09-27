@@ -1,0 +1,602 @@
+#!/usr/bin/env bash
+# agent-notify-setup — install/uninstall desktop notifications for AI coding agents.
+#
+# Detects Kiro (kiro-cli) and Antigravity (agy) and wires up notifications so
+# you get a popup when an agent finishes responding or needs your approval.
+# Works on any Linux desktop (X11 or Wayland) with a freedesktop notification
+# daemon (dunst, mako, swaync, notifd, quickshell, etc.).
+#
+# Usage:
+#   agent-notify-setup install      # detect agents and configure all found
+#   agent-notify-setup uninstall    # remove all hooks and scripts
+#   agent-notify-setup status       # show current state
+#   agent-notify-setup test         # fire a test notification for each agent
+#
+# Installed files:
+#   ~/.local/share/agent-notify/    scripts + icon (never modified by agents)
+#   ~/.local/bin/agent-notify-setup this installer (self-referential, safe)
+
+set -euo pipefail
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+SHARE_DIR="$HOME/.local/share/agent-notify"
+NOTIFY_SH="$SHARE_DIR/agent-notify.sh"
+AGY_SH="$SHARE_DIR/agent-notify-agy.sh"
+KIRO_SVG="$SHARE_DIR/kiro.svg"
+ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+
+KIRO_AGENTS_DIR="$HOME/.kiro/agents"
+KIRO_AGENT_JSON="$KIRO_AGENTS_DIR/default.json"
+
+AGY_HOOKS_JSON="$HOME/.gemini/antigravity-cli/hooks.json"
+AGY_CONFIG_HOOKS_JSON="$HOME/.gemini/config/hooks.json"
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[0;33m'
+    BLU='\033[0;34m'; BLD='\033[1m'; RST='\033[0m'
+else
+    RED=''; GRN=''; YLW=''; BLU=''; BLD=''; RST=''
+fi
+
+info()    { printf "${BLU}  →${RST} %s\n" "$*"; }
+ok()      { printf "${GRN}  ✓${RST} %s\n" "$*"; }
+warn()    { printf "${YLW}  !${RST} %s\n" "$*"; }
+err()     { printf "${RED}  ✗${RST} %s\n" "$*" >&2; }
+section() { printf "\n${BLD}%s${RST}\n" "$*"; }
+
+# ── Detection ─────────────────────────────────────────────────────────────────
+detect_kiro() {
+    command -v kiro-cli >/dev/null 2>&1 && [[ -d "$KIRO_AGENTS_DIR" ]]
+}
+
+detect_agy() {
+    command -v agy >/dev/null 2>&1 && [[ -d "$HOME/.gemini/antigravity-cli" ]]
+}
+
+detect_notify_send() {
+    command -v notify-send >/dev/null 2>&1
+}
+
+# ── Backup helper ─────────────────────────────────────────────────────────────
+backup() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    local bak="${file}.bak-$(date +%Y%m%d%H%M%S)"
+    cp "$file" "$bak"
+    info "Backed up $(basename "$file") → $(basename "$bak")"
+}
+
+# ── Install scripts ───────────────────────────────────────────────────────────
+install_scripts() {
+    section "Installing notification scripts"
+    mkdir -p "$SHARE_DIR"
+
+    # agent-notify.sh ─────────────────────────────────────────────────────────
+    cat > "$NOTIFY_SH" << 'NOTIFY_EOF'
+#!/usr/bin/env bash
+# agent-notify.sh — shared desktop notification helper for AI coding agents.
+# Managed by agent-notify-setup. Edit via: agent-notify-setup install
+set -euo pipefail
+
+KIND="${1:-done}"
+APP="${2:-AI Agent}"
+BODY_ARG="${3:-}"
+
+# Restore D-Bus/display session env when spawned with a stripped environment.
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && [[ -S "$XDG_RUNTIME_DIR/bus" ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+: "${WAYLAND_DISPLAY:=wayland-1}"; export WAYLAND_DISPLAY
+: "${DISPLAY:=:0}";                export DISPLAY
+
+# Auto-detect icon: prefer a hicolor theme entry named after the app.
+_default_icon() {
+    local name="${1,,}"
+    if [[ -f "$HOME/.local/share/icons/hicolor/scalable/apps/${name}.svg" ]] || \
+       [[ -n "$(find /usr/share/icons/hicolor "$HOME/.local/share/icons/hicolor" \
+               -name "${name}.*" 2>/dev/null | head -1)" ]]; then
+        printf '%s' "$name"
+    else
+        printf 'dialog-information'
+    fi
+}
+ICON="${AGENT_NOTIFY_ICON:-$(_default_icon "$APP")}"
+
+EVENT=""
+if [[ ! -t 0 ]]; then EVENT="$(cat || true)"; fi
+
+json_str() {
+    local key="$1"
+    { printf '%s' "$EVENT" \
+        | grep -oE "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+        | head -n1 \
+        | sed -E "s/.*:[[:space:]]*\"([^\"]*)\"/\1/"; } || true
+}
+
+SOUND_DIR="/usr/share/sounds/freedesktop/stereo"
+play_sound() {
+    local file="$SOUND_DIR/$1"; [[ -r "$file" ]] || return 0
+    if   command -v paplay            >/dev/null 2>&1; then paplay            "$file" >/dev/null 2>&1 &
+    elif command -v canberra-gtk-play >/dev/null 2>&1; then canberra-gtk-play -f "$file" >/dev/null 2>&1 &
+    fi
+    disown 2>/dev/null || true
+}
+
+case "$KIND" in
+    done)
+        URGENCY="normal"
+        TITLE="$APP — task complete"
+        BODY="${BODY_ARG:-Finished responding. Ready for your next instruction.}"
+        play_sound "complete.oga"
+        ;;
+    permission)
+        URGENCY="critical"
+        TITLE="$APP — needs your approval"
+        if [[ -n "$BODY_ARG" ]]; then
+            BODY="$BODY_ARG"
+        else
+            TOOL="$(json_str tool_name)"
+            BODY="Waiting for approval to use: ${TOOL:-a tool}"
+        fi
+        play_sound "window-attention.oga"
+        ;;
+    *)
+        URGENCY="normal"
+        TITLE="$APP"
+        BODY="${BODY_ARG:-$KIND}"
+        ;;
+esac
+
+notify-send -a "$APP" -u "$URGENCY" -i "$ICON" "$TITLE" "$BODY" || true
+exit 0
+NOTIFY_EOF
+    chmod +x "$NOTIFY_SH"
+    ok "agent-notify.sh"
+
+    # agent-notify-agy.sh ─────────────────────────────────────────────────────
+    cat > "$AGY_SH" << AGYWRAPPER_EOF
+#!/usr/bin/env bash
+# agent-notify-agy.sh — Antigravity (agy) hook wrapper.
+# Managed by agent-notify-setup.
+# agy hooks: read JSON from stdin, MUST print JSON on stdout, exit 0.
+set -euo pipefail
+
+NOTIFY="$NOTIFY_SH"
+KIND="\${1:-stop}"
+APP="Antigravity"
+
+: "\${XDG_RUNTIME_DIR:=/run/user/\$(id -u)}"
+if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]] && [[ -S "\$XDG_RUNTIME_DIR/bus" ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=\$XDG_RUNTIME_DIR/bus"
+fi
+: "\${WAYLAND_DISPLAY:=wayland-1}"; export WAYLAND_DISPLAY
+: "\${DISPLAY:=:0}";                export DISPLAY
+
+PAYLOAD=""
+if [[ ! -t 0 ]]; then PAYLOAD="\$(cat || true)"; fi
+
+json_str() {
+    local key="\$1"
+    { printf '%s' "\$PAYLOAD" \
+        | grep -oE "\"\$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+        | head -n1 \
+        | sed -E "s/.*:[[:space:]]*\"([^\"]*)\"/\\1/"; } || true
+}
+
+AGY_ICON="\$HOME/.gemini/config/logo.png"
+[[ -r "\$AGY_ICON" ]] && export AGENT_NOTIFY_ICON="\$AGY_ICON"
+
+case "\$KIND" in
+    stop)
+        printf '%s' "\$PAYLOAD" | "\$NOTIFY" done "\$APP" || true
+        printf '{}\n'
+        ;;
+    pretool)
+        CMD="\$(json_str CommandLine)"
+        BODY="About to run: \${CMD:-a command}"
+        printf '%s' "\$PAYLOAD" | "\$NOTIFY" permission "\$APP" "\$BODY" || true
+        printf '{"decision":"ask"}\n'
+        ;;
+    *)
+        printf '{}\n'
+        ;;
+esac
+exit 0
+AGYWRAPPER_EOF
+    chmod +x "$AGY_SH"
+    ok "agent-notify-agy.sh"
+}
+
+# ── Install Kiro icon ──────────────────────────────────────────────────────────
+install_kiro_icon() {
+    mkdir -p "$ICON_DIR"
+    # Only write if the source SVG exists and the destination is missing or older.
+    if [[ -f "$KIRO_SVG" ]]; then
+        cp "$KIRO_SVG" "$ICON_DIR/kiro.svg"
+    else
+        # Embed a minimal purple "K" icon directly.
+        cat > "$ICON_DIR/kiro.svg" << 'SVG_EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="kiroBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7C5CFF"/>
+      <stop offset="1" stop-color="#4B32C3"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#kiroBg)"/>
+  <g fill="#FFFFFF">
+    <rect x="38" y="34" width="12" height="60" rx="3"/>
+    <path d="M52 64 L82 34 h16 L66 66 L98 94 h-16 L52 66 z"/>
+  </g>
+</svg>
+SVG_EOF
+    fi
+    # Refresh icon cache (non-fatal if gtk-update-icon-cache not present).
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+    fi
+    ok "Kiro icon → $ICON_DIR/kiro.svg"
+}
+
+# ── Configure Kiro ────────────────────────────────────────────────────────────
+install_kiro() {
+    section "Configuring Kiro"
+
+    if [[ ! -f "$KIRO_AGENT_JSON" ]]; then
+        warn "default.json not found at $KIRO_AGENT_JSON — creating minimal agent"
+        mkdir -p "$KIRO_AGENTS_DIR"
+        echo '{"name":"default","tools":["*"],"useLegacyMcpJson":true}' > "$KIRO_AGENT_JSON"
+    fi
+
+    backup "$KIRO_AGENT_JSON"
+
+    # Merge hooks using Python's json module (available on virtually all Linux).
+    python3 - "$KIRO_AGENT_JSON" "$NOTIFY_SH" << 'PYEOF'
+import json, sys
+
+path   = sys.argv[1]
+notify = sys.argv[2]
+
+with open(path) as f:
+    cfg = json.load(f)
+
+hooks = cfg.setdefault("hooks", {})
+
+# stop hook
+hooks.setdefault("stop", [])
+stop_cmd = f"{notify} done 'Kiro'"
+if not any(h.get("command") == stop_cmd for h in hooks["stop"]):
+    hooks["stop"].append({"command": stop_cmd, "timeout_ms": 5000})
+
+# preToolUse hooks (write + shell)
+hooks.setdefault("preToolUse", [])
+perm_cmd = f"{notify} permission 'Kiro'"
+for matcher in ("write", "shell"):
+    if not any(h.get("command") == perm_cmd and h.get("matcher") == matcher
+               for h in hooks["preToolUse"]):
+        hooks["preToolUse"].append({
+            "matcher": matcher,
+            "command": perm_cmd,
+            "timeout_ms": 5000,
+        })
+
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+
+print("ok")
+PYEOF
+
+    ok "Kiro hooks merged into default.json"
+
+    install_kiro_icon
+}
+
+remove_kiro() {
+    section "Removing Kiro hooks"
+    [[ -f "$KIRO_AGENT_JSON" ]] || { warn "default.json not found, skipping"; return; }
+
+    backup "$KIRO_AGENT_JSON"
+    python3 - "$KIRO_AGENT_JSON" "$NOTIFY_SH" << 'PYEOF'
+import json, sys
+
+path   = sys.argv[1]
+notify = sys.argv[2]
+
+with open(path) as f:
+    cfg = json.load(f)
+
+hooks = cfg.get("hooks", {})
+stop_cmd = f"{notify} done 'Kiro'"
+perm_cmd = f"{notify} permission 'Kiro'"
+
+hooks["stop"]       = [h for h in hooks.get("stop", [])       if h.get("command") != stop_cmd]
+hooks["preToolUse"] = [h for h in hooks.get("preToolUse", []) if h.get("command") != perm_cmd]
+
+cfg["hooks"] = hooks
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+print("ok")
+PYEOF
+    ok "Kiro hooks removed"
+}
+
+# ── Configure Antigravity ─────────────────────────────────────────────────────
+install_agy() {
+    section "Configuring Antigravity (agy)"
+
+    # Neutralize the duplicate global hooks config so only antigravity-cli/hooks.json runs.
+    if [[ -f "$AGY_CONFIG_HOOKS_JSON" ]]; then
+        local content
+        content="$(cat "$AGY_CONFIG_HOOKS_JSON")"
+        if [[ "$content" != "{}" && "$content" != "{ }" ]]; then
+            backup "$AGY_CONFIG_HOOKS_JSON"
+            printf '{}\n' > "$AGY_CONFIG_HOOKS_JSON"
+            ok "Neutralized $AGY_CONFIG_HOOKS_JSON (prevents duplicate notifications)"
+        fi
+    fi
+
+    backup "$AGY_HOOKS_JSON"
+
+    cat > "$AGY_HOOKS_JSON" << HOOKS_EOF
+{
+  "desktop-notify-stop": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "$AGY_SH stop",
+        "timeout": 10
+      }
+    ]
+  },
+  "desktop-notify-permission": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command|write_to_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$AGY_SH pretool",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+HOOKS_EOF
+    ok "agy hooks.json written"
+}
+
+remove_agy() {
+    section "Removing Antigravity hooks"
+    [[ -f "$AGY_HOOKS_JSON" ]] || { warn "agy hooks.json not found, skipping"; return; }
+    backup "$AGY_HOOKS_JSON"
+    printf '{}\n' > "$AGY_HOOKS_JSON"
+    ok "agy hooks cleared"
+}
+
+# ── Status ────────────────────────────────────────────────────────────────────
+cmd_status() {
+    section "agent-notify-setup status"
+
+    # notify-send
+    if detect_notify_send; then
+        ok "notify-send found: $(command -v notify-send)"
+    else
+        err "notify-send not found — install libnotify"
+    fi
+
+    # D-Bus
+    : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+    if [[ -S "$XDG_RUNTIME_DIR/bus" ]]; then
+        ok "D-Bus session socket: $XDG_RUNTIME_DIR/bus"
+    else
+        warn "D-Bus session socket not found at $XDG_RUNTIME_DIR/bus"
+    fi
+
+    # Shared scripts
+    printf '\n'
+    for s in "$NOTIFY_SH" "$AGY_SH"; do
+        if [[ -x "$s" ]]; then
+            ok "Script: $s"
+        else
+            warn "Missing/not-executable: $s  (run: agent-notify-setup install)"
+        fi
+    done
+
+    # Kiro
+    printf '\n'
+    if detect_kiro; then
+        ok "Kiro detected ($(command -v kiro-cli))"
+        if [[ -f "$KIRO_AGENT_JSON" ]]; then
+            local stop_ok perm_ok
+            stop_ok=$(python3 -c "
+import json, sys
+try:
+    cfg = json.load(open('$KIRO_AGENT_JSON'))
+    hooks = cfg.get('hooks', {})
+    notify = '$NOTIFY_SH'
+    cmd = f\"{notify} done 'Kiro'\"
+    print('yes' if any(h.get('command') == cmd for h in hooks.get('stop', [])) else 'no')
+except: print('no')
+")
+            perm_ok=$(python3 -c "
+import json, sys
+try:
+    cfg = json.load(open('$KIRO_AGENT_JSON'))
+    hooks = cfg.get('hooks', {})
+    notify = '$NOTIFY_SH'
+    cmd = f\"{notify} permission 'Kiro'\"
+    print('yes' if any(h.get('command') == cmd for h in hooks.get('preToolUse', [])) else 'no')
+except: print('no')
+")
+            [[ "$stop_ok" == "yes" ]] && ok "  stop hook configured" || warn "  stop hook missing"
+            [[ "$perm_ok" == "yes" ]] && ok "  permission hook configured" || warn "  permission hook missing"
+        else
+            warn "  default.json not found"
+        fi
+        # Icon
+        if [[ -f "$ICON_DIR/kiro.svg" ]]; then
+            ok "  Kiro icon installed"
+        else
+            warn "  Kiro icon missing"
+        fi
+    else
+        info "Kiro not detected (kiro-cli not on PATH or ~/.kiro/agents missing)"
+    fi
+
+    # Antigravity
+    printf '\n'
+    if detect_agy; then
+        ok "Antigravity detected ($(command -v agy))"
+        if [[ -f "$AGY_HOOKS_JSON" ]]; then
+            local agy_hook_ok
+            agy_hook_ok=$(python3 << PYEOF
+import json
+
+path   = "$AGY_HOOKS_JSON"
+notify = "$AGY_SH"
+
+def has_notify(cfg, notify):
+    for v in cfg.values():
+        if not isinstance(v, dict):
+            continue
+        for event_hooks in v.values():
+            if not isinstance(event_hooks, list):
+                continue
+            for h in event_hooks:
+                if not isinstance(h, dict):
+                    continue
+                if notify in h.get("command", ""):
+                    return True
+                for inner in h.get("hooks", []):
+                    if isinstance(inner, dict) and notify in inner.get("command", ""):
+                        return True
+    return False
+
+try:
+    cfg = json.load(open(path))
+    print("yes" if has_notify(cfg, notify) else "no")
+except Exception:
+    print("no")
+PYEOF
+)
+            [[ "$agy_hook_ok" == "yes" ]] && ok "  hooks.json configured" || warn "  hooks.json not configured or points elsewhere"
+        else
+            warn "  $AGY_HOOKS_JSON not found"
+        fi
+    else
+        info "Antigravity not detected (agy not on PATH or ~/.gemini/antigravity-cli missing)"
+    fi
+}
+
+# ── Test ──────────────────────────────────────────────────────────────────────
+cmd_test() {
+    section "Sending test notifications"
+
+    if detect_kiro; then
+        info "Kiro — task complete"
+        echo '{"hook_event_name":"stop"}' | "$NOTIFY_SH" done 'Kiro' || true
+        sleep 1
+        info "Kiro — needs approval"
+        echo '{"hook_event_name":"preToolUse","tool_name":"shell"}' | "$NOTIFY_SH" permission 'Kiro' || true
+        sleep 1
+    fi
+
+    if detect_agy; then
+        info "Antigravity — task complete"
+        echo '{"terminationReason":"NO_TOOL_CALL"}' | "$AGY_SH" stop || true
+        sleep 1
+        info "Antigravity — needs approval"
+        echo '{"CommandLine":"ls -la"}' | "$AGY_SH" pretool || true
+    fi
+
+    ok "Test notifications sent — check your desktop"
+}
+
+# ── Install / Uninstall ───────────────────────────────────────────────────────
+cmd_install() {
+    section "agent-notify-setup install"
+
+    if ! detect_notify_send; then
+        err "notify-send not found. Install libnotify (e.g. pacman -S libnotify / apt install libnotify-bin)"
+        exit 1
+    fi
+
+    install_scripts
+
+    local installed=0
+
+    if detect_kiro; then
+        install_kiro
+        (( installed++ )) || true
+    else
+        warn "Kiro not detected — skipping (install kiro-cli and re-run to configure)"
+    fi
+
+    if detect_agy; then
+        install_agy
+        (( installed++ )) || true
+    else
+        warn "Antigravity not detected — skipping (install agy and re-run to configure)"
+    fi
+
+    if (( installed == 0 )); then
+        warn "No agents detected. Install kiro-cli or agy, then re-run: agent-notify-setup install"
+        exit 1
+    fi
+
+    printf '\n'
+    ok "Done. Restart your agent sessions for hooks to take effect."
+    printf '\n'
+    info "Run 'agent-notify-setup test' to verify notifications."
+    info "Run 'agent-notify-setup status' to check configuration."
+}
+
+cmd_uninstall() {
+    section "agent-notify-setup uninstall"
+
+    detect_kiro && remove_kiro || true
+    detect_agy  && remove_agy  || true
+
+    info "Scripts left in place at $SHARE_DIR (safe to delete manually)"
+    ok "Uninstall complete. Restart agent sessions for changes to take effect."
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+usage() {
+    cat << EOF
+${BLD}agent-notify-setup${RST} — desktop notifications for AI coding agents
+
+${BLD}USAGE${RST}
+  agent-notify-setup <command>
+
+${BLD}COMMANDS${RST}
+  install     Detect installed agents and configure notifications for each
+  uninstall   Remove agent notification hooks (scripts are kept)
+  status      Show current installation state
+  test        Send test notifications for each detected agent
+
+${BLD}SUPPORTED AGENTS${RST}
+  Kiro        kiro-cli + ~/.kiro/agents/
+  Antigravity agy     + ~/.gemini/antigravity-cli/
+
+${BLD}REQUIREMENTS${RST}
+  notify-send (libnotify), bash, python3
+  Any freedesktop notification daemon (dunst, mako, swaync, quickshell, …)
+EOF
+}
+
+case "${1:-}" in
+    install)   cmd_install   ;;
+    uninstall) cmd_uninstall ;;
+    status)    cmd_status    ;;
+    test)      cmd_test      ;;
+    -h|--help|help|"") usage ;;
+    *) err "Unknown command: $1"; usage; exit 1 ;;
+esac
